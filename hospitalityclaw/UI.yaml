@@ -1,0 +1,804 @@
+ocui_version: "1.0"
+skill: hospitalityclaw
+skill_version: "0.1.0"
+display_name: Front Desk
+icon: building
+color: "#0891b2"
+default_entity: reservation
+domains:
+  - key: front_desk
+    label: Front desk
+    icon: calendar
+    entities: [reservation, guest, folio]
+  - key: rooms
+    label: Rooms & rates
+    icon: door-open
+    entities: [room, room_type, rate_plan, tax_rule]
+  - key: property
+    label: Property
+    icon: building
+    entities: [hotel]
+dashboard:
+  kpis:
+    - key: reservations
+      label: Reservations
+      type: count
+      action: status
+      field: reservations
+      icon: clock
+      drill_action: list-reservations
+    - key: guests
+      label: Guests
+      type: count
+      action: status
+      field: guests
+      icon: users
+      drill_action: list-guests
+    - key: rooms
+      label: Rooms
+      type: count
+      action: status
+      field: rooms
+      icon: package
+      drill_action: list-rooms
+    - key: folios
+      label: Open folios
+      type: count
+      action: status
+      field: folios
+      icon: dollar-sign
+      drill_action: list-folios
+  quick_actions:
+    - action: add-reservation
+      label: New Reservation
+      icon: plus
+    - action: add-guest
+      label: New Guest
+      icon: plus
+    - action: add-room
+      label: New Room
+      icon: plus
+    - action: check-in
+      label: Check in
+      icon: plus
+entities:
+  hotel:
+    label: Property
+    label_plural: Properties
+    icon: building
+    table: hospitalityclaw_hotel
+    id_col: id
+    name_col: name
+    primary_field: name
+    identifier_field: id
+    fields:
+      name:
+        type: text
+        label: Hotel name
+        required: true
+        in_list_view: true
+        in_form_view: true
+      timezone:
+        type: text
+        label: Timezone
+        in_list_view: true
+        in_form_view: true
+      currency:
+        type: text
+        label: Currency
+        in_list_view: true
+        in_form_view: true
+      country:
+        type: text
+        label: Country
+        in_list_view: true
+        in_form_view: true
+      address:
+        type: textarea
+        label: Address
+        in_form_view: true
+      phone:
+        type: text
+        label: Phone
+        in_form_view: true
+      email:
+        type: text
+        label: Email
+        in_form_view: true
+    views:
+      list:
+        columns:
+          - { field: name, link: true }
+          - { field: timezone }
+          - { field: currency }
+          - { field: country }
+      form:
+        groups:
+          - { label: Property, fields: [name, timezone, currency, country], columns: 2 }
+          - { label: Contact, fields: [address, phone, email], columns: 2 }
+      detail:
+        header: { title_field: name, subtitle_field: country }
+        sections:
+          - { label: Details, fields: [name, timezone, currency, country, address, phone, email], columns: 2 }
+        actions:
+          - { action: update-hotel, label: Edit, primary: true }
+  room_type:
+    label: Room type
+    label_plural: Room types
+    icon: layers
+    table: hospitalityclaw_room_type
+    id_col: id
+    name_col: name
+    primary_field: name
+    identifier_field: code
+    fields:
+      hotel_id:
+        type: link
+        label: Property
+        required: true
+        link_entity: hotel
+        link_display_field: name
+        link_search_action: list-hotels
+        in_form_view: true
+      name:
+        type: text
+        label: Name
+        required: true
+        in_list_view: true
+        in_form_view: true
+      code:
+        type: text
+        label: Code
+        required: true
+        in_list_view: true
+        in_form_view: true
+      base_rate:
+        type: currency
+        label: Base rate
+        required: true
+        in_list_view: true
+        in_form_view: true
+      max_occupancy:
+        type: integer
+        label: Max occupancy
+        in_list_view: true
+        in_form_view: true
+      description:
+        type: textarea
+        label: Description
+        in_form_view: true
+    views:
+      list:
+        columns:
+          - { field: name, link: true }
+          - { field: code }
+          - { field: base_rate, align: right }
+          - { field: max_occupancy, align: right }
+      form:
+        groups:
+          - { label: Room type, fields: [hotel_id, name, code, base_rate, max_occupancy, description], columns: 2 }
+  room:
+    label: Room
+    label_plural: Rooms
+    icon: door-open
+    table: hospitalityclaw_room
+    id_col: id
+    name_col: room_number
+    primary_field: room_number
+    identifier_field: room_number
+    status_field: status
+    status_colors:
+      vacant: green
+      occupied: blue
+      dirty: yellow
+      out_of_order: red
+    fields:
+      hotel_id:
+        type: link
+        label: Property
+        required: true
+        link_entity: hotel
+        link_display_field: name
+        link_search_action: list-hotels
+        in_form_view: true
+      room_type_id:
+        type: link
+        label: Room type
+        required: true
+        link_entity: room_type
+        link_display_field: name
+        link_search_action: list-room-types
+        in_list_view: true
+        in_form_view: true
+      room_number:
+        type: text
+        label: Room number
+        required: true
+        in_list_view: true
+        in_form_view: true
+      floor:
+        type: text
+        label: Floor
+        in_list_view: true
+        in_form_view: true
+      status:
+        type: select
+        label: Status
+        in_list_view: true
+        in_form_view: true
+        options:
+          - { value: vacant, label: Vacant }
+          - { value: occupied, label: Occupied }
+          - { value: dirty, label: Dirty }
+          - { value: out_of_order, label: Out of order }
+    views:
+      list:
+        columns:
+          - { field: room_number, link: true }
+          - { field: room_type_id }
+          - { field: floor }
+          - { field: status }
+        filters:
+          - { field: status, type: select, label: Status }
+      form:
+        groups:
+          - { label: Room, fields: [hotel_id, room_type_id, room_number, floor, status], columns: 2 }
+  guest:
+    label: Guest
+    label_plural: Guests
+    icon: users
+    table: hospitalityclaw_guest
+    id_col: id
+    name_col: last_name
+    primary_field: last_name
+    secondary_field: first_name
+    identifier_field: id
+    fields:
+      first_name:
+        type: text
+        label: First name
+        required: true
+        in_list_view: true
+        in_form_view: true
+      last_name:
+        type: text
+        label: Last name
+        required: true
+        in_list_view: true
+        in_form_view: true
+      email:
+        type: text
+        label: Email
+        in_list_view: true
+        in_form_view: true
+      phone:
+        type: text
+        label: Phone
+        in_list_view: true
+        in_form_view: true
+      nationality:
+        type: text
+        label: Nationality
+        in_form_view: true
+      id_number:
+        type: text
+        label: ID number
+        in_form_view: true
+      notes:
+        type: textarea
+        label: Notes
+        in_form_view: true
+    views:
+      list:
+        columns:
+          - { field: last_name, link: true }
+          - { field: first_name }
+          - { field: email }
+          - { field: phone }
+      form:
+        groups:
+          - { label: Guest, fields: [first_name, last_name, email, phone, nationality, id_number, notes], columns: 2 }
+      detail:
+        header: { title_field: last_name, subtitle_field: email }
+        sections:
+          - { label: Details, fields: [first_name, last_name, email, phone, nationality, id_number, notes], columns: 2 }
+  reservation:
+    label: Reservation
+    label_plural: Reservations
+    icon: calendar
+    table: hospitalityclaw_reservation
+    id_col: id
+    name_col: check_in
+    primary_field: check_in
+    identifier_field: id
+    status_field: status
+    status_colors:
+      reserved: blue
+      checked_in: green
+      checked_out: gray
+      cancelled: red
+      no_show: yellow
+    fields:
+      hotel_id:
+        type: link
+        label: Property
+        required: true
+        link_entity: hotel
+        link_display_field: name
+        link_search_action: list-hotels
+        in_form_view: true
+      guest_id:
+        type: link
+        label: Guest
+        required: true
+        link_entity: guest
+        link_display_field: last_name
+        link_search_action: list-guests
+        in_list_view: true
+        in_form_view: true
+      room_type_id:
+        type: link
+        label: Room type
+        required: true
+        link_entity: room_type
+        link_display_field: name
+        link_search_action: list-room-types
+        in_list_view: true
+        in_form_view: true
+      room_id:
+        type: link
+        label: Room
+        link_entity: room
+        link_display_field: room_number
+        link_search_action: list-rooms
+        in_list_view: true
+        in_form_view: true
+      check_in:
+        type: date
+        label: Check-in
+        required: true
+        in_list_view: true
+        in_form_view: true
+      check_out:
+        type: date
+        label: Check-out
+        required: true
+        in_list_view: true
+        in_form_view: true
+      adults:
+        type: integer
+        label: Adults
+        in_form_view: true
+      children:
+        type: integer
+        label: Children
+        in_form_view: true
+      rate:
+        type: currency
+        label: Rate
+        in_list_view: true
+        in_form_view: true
+      status:
+        type: select
+        label: Status
+        in_list_view: true
+        options:
+          - { value: reserved, label: Reserved }
+          - { value: checked_in, label: Checked in }
+          - { value: checked_out, label: Checked out }
+          - { value: cancelled, label: Cancelled }
+          - { value: no_show, label: No show }
+      notes:
+        type: textarea
+        label: Notes
+        in_form_view: true
+    views:
+      list:
+        columns:
+          - { field: check_in, link: true }
+          - { field: check_out }
+          - { field: guest_id }
+          - { field: room_type_id }
+          - { field: status }
+          - { field: rate, align: right }
+        filters:
+          - { field: status, type: select, label: Status }
+      form:
+        groups:
+          - { label: Stay, fields: [hotel_id, guest_id, room_type_id, room_id, check_in, check_out, adults, children, rate, notes], columns: 2 }
+      detail:
+        header: { title_field: check_in, subtitle_field: status, status_field: status }
+        sections:
+          - { label: Stay, fields: [guest_id, hotel_id, room_type_id, room_id, check_in, check_out, adults, children, rate, notes], columns: 2 }
+        actions:
+          - { action: check-in, label: Check in, requires_status: reserved, primary: true }
+          - { action: check-out, label: Check out, requires_status: checked_in }
+  folio:
+    label: Folio
+    label_plural: Folios
+    icon: receipt
+    table: hospitalityclaw_folio
+    id_col: id
+    name_col: id
+    primary_field: id
+    identifier_field: id
+    status_field: status
+    status_colors:
+      open: blue
+      closed: gray
+    fields:
+      reservation_id:
+        type: link
+        label: Reservation
+        link_entity: reservation
+        link_search_action: list-reservations
+        in_list_view: true
+      guest_id:
+        type: link
+        label: Guest
+        link_entity: guest
+        link_display_field: last_name
+        link_search_action: list-guests
+        in_list_view: true
+      status:
+        type: select
+        label: Status
+        in_list_view: true
+        options:
+          - { value: open, label: Open }
+          - { value: closed, label: Closed }
+          - { value: cancelled, label: Cancelled }
+      balance:
+        type: currency
+        label: Balance
+        in_list_view: true
+    views:
+      list:
+        columns:
+          - { field: id, link: true }
+          - { field: guest_id }
+          - { field: status }
+          - { field: balance, align: right }
+        filters:
+          - { field: status, type: select, label: Status }
+      detail:
+        header: { title_field: id, status_field: status, amount_field: balance }
+        sections:
+          - { label: Folio, fields: [reservation_id, guest_id, status, balance], columns: 2 }
+        actions:
+          - { action: add-folio-charge, label: Add charge, primary: true }
+          - { action: post-room-tariff, label: Post room tariff }
+          - { action: settle-folio, label: Settle bill }
+  rate_plan:
+    label: Rate plan
+    label_plural: Rate plans
+    icon: calendar
+    table: hospitalityclaw_rate_plan
+    id_col: id
+    name_col: name
+    primary_field: name
+    identifier_field: code
+    fields:
+      hotel_id:
+        type: link
+        label: Hotel
+        required: true
+        link_entity: hotel
+        link_search_action: list-hotels
+        in_form_view: true
+      room_type_id:
+        type: link
+        label: Room type
+        link_entity: room_type
+        link_display_field: name
+        link_search_action: list-room-types
+        in_list_view: true
+        in_form_view: true
+      name:
+        type: text
+        label: Name
+        required: true
+        in_list_view: true
+        in_form_view: true
+      code:
+        type: text
+        label: Code
+        required: true
+        in_list_view: true
+        in_form_view: true
+      start_date:
+        type: date
+        label: Start
+        required: true
+        in_list_view: true
+        in_form_view: true
+      end_date:
+        type: date
+        label: End
+        required: true
+        in_list_view: true
+        in_form_view: true
+      nightly_rate:
+        type: currency
+        label: Nightly rate
+        required: true
+        in_list_view: true
+        in_form_view: true
+      priority:
+        type: integer
+        label: Priority
+        in_list_view: true
+        in_form_view: true
+      is_active:
+        type: boolean
+        label: Active
+        in_list_view: true
+        in_form_view: true
+      notes:
+        type: textarea
+        label: Notes
+        in_form_view: true
+    views:
+      list:
+        columns:
+          - { field: name, link: true }
+          - { field: code }
+          - { field: room_type_id }
+          - { field: start_date }
+          - { field: end_date }
+          - { field: nightly_rate, align: right }
+          - { field: priority }
+          - { field: is_active }
+      form:
+        groups:
+          - { label: Plan, fields: [hotel_id, room_type_id, name, code, start_date, end_date, nightly_rate, priority, is_active, notes], columns: 2 }
+      detail:
+        header: { title_field: name, subtitle_field: code }
+        sections:
+          - { label: Rate plan, fields: [hotel_id, room_type_id, name, code, start_date, end_date, nightly_rate, priority, is_active, notes], columns: 2 }
+  tax_rule:
+    label: Tax rule
+    label_plural: Tax rules
+    icon: percent
+    table: hospitalityclaw_tax_rule
+    id_col: id
+    name_col: name
+    primary_field: name
+    identifier_field: name
+    fields:
+      hotel_id:
+        type: link
+        label: Hotel
+        required: true
+        link_entity: hotel
+        link_search_action: list-hotels
+        in_form_view: true
+      name:
+        type: text
+        label: Name
+        required: true
+        in_list_view: true
+        in_form_view: true
+      rate_percent:
+        type: number
+        label: Rate %
+        required: true
+        in_list_view: true
+        in_form_view: true
+      applies_to:
+        type: select
+        label: Applies to
+        required: true
+        in_list_view: true
+        in_form_view: true
+        options:
+          - { value: room, label: Room }
+          - { value: fnb, label: F&B / minibar }
+          - { value: all, label: All charges }
+      is_default:
+        type: boolean
+        label: Default
+        in_list_view: true
+        in_form_view: true
+      is_active:
+        type: boolean
+        label: Active
+        in_list_view: true
+        in_form_view: true
+    views:
+      list:
+        columns:
+          - { field: name, link: true }
+          - { field: rate_percent, align: right }
+          - { field: applies_to }
+          - { field: is_default }
+          - { field: is_active }
+      form:
+        groups:
+          - { label: Tax rule, fields: [hotel_id, name, rate_percent, applies_to, is_default, is_active], columns: 2 }
+      detail:
+        header: { title_field: name }
+        sections:
+          - { label: Tax rule, fields: [hotel_id, name, rate_percent, applies_to, is_default, is_active], columns: 2 }
+action_map:
+  list-hotels:
+    component: DataTable
+    entity: hotel
+    searchable: true
+    add_action: null
+  get-hotel:
+    component: DetailView
+    entity: hotel
+  update-hotel:
+    component: FormView
+    entity: hotel
+    mode: edit
+    success_toast: Property updated
+  list-room-types:
+    component: DataTable
+    entity: room_type
+    searchable: true
+    add_action: add-room-type
+  get-room-type:
+    component: DetailView
+    entity: room_type
+  add-room-type:
+    component: FormView
+    entity: room_type
+    mode: create
+    success_redirect: list-room-types
+    success_toast: Room type created
+  update-room-type:
+    component: FormView
+    entity: room_type
+    mode: edit
+    success_toast: Room type updated
+  delete-room-type:
+    component: FormView
+    entity: room_type
+    mode: action
+    success_toast: Room type deleted
+  list-rooms:
+    component: DataTable
+    entity: room
+    searchable: true
+    add_action: add-room
+  get-room:
+    component: DetailView
+    entity: room
+  add-room:
+    component: FormView
+    entity: room
+    mode: create
+    success_redirect: list-rooms
+    success_toast: Room created
+  update-room:
+    component: FormView
+    entity: room
+    mode: edit
+    success_toast: Room updated
+  delete-room:
+    component: FormView
+    entity: room
+    mode: action
+    success_toast: Room deleted
+  update-room-status:
+    component: FormView
+    entity: room
+    mode: edit
+    success_toast: Room status updated
+  list-guests:
+    component: DataTable
+    entity: guest
+    searchable: true
+    add_action: add-guest
+  get-guest:
+    component: DetailView
+    entity: guest
+  add-guest:
+    component: FormView
+    entity: guest
+    mode: create
+    success_redirect: list-guests
+    success_toast: Guest created
+  list-reservations:
+    component: DataTable
+    entity: reservation
+    searchable: true
+    add_action: add-reservation
+  get-reservation:
+    component: DetailView
+    entity: reservation
+  add-reservation:
+    component: FormView
+    entity: reservation
+    mode: create
+    success_redirect: list-reservations
+    success_toast: Reservation created
+  assign-room:
+    component: FormView
+    entity: reservation
+    mode: action
+    success_toast: Room assigned
+  check-in:
+    component: FormView
+    entity: reservation
+    mode: action
+    success_toast: Guest checked in
+  check-out:
+    component: FormView
+    entity: reservation
+    mode: action
+    success_toast: Guest checked out
+  cancel-reservation:
+    component: FormView
+    entity: reservation
+    mode: action
+    success_toast: Reservation cancelled
+  list-folios:
+    component: DataTable
+    entity: folio
+    searchable: true
+  get-folio:
+    component: DetailView
+    entity: folio
+  add-folio-charge:
+    component: FormView
+    entity: folio
+    mode: action
+    success_toast: Charge posted
+  settle-folio:
+    component: FormView
+    entity: folio
+    mode: action
+    success_toast: Folio settled — payment posted to GL
+  post-room-tariff:
+    component: FormView
+    entity: folio
+    mode: action
+    success_toast: Room tariff posted to ledger
+  list-rate-plans:
+    component: DataTable
+    entity: rate_plan
+    searchable: true
+    add_action: add-rate-plan
+  add-rate-plan:
+    component: FormView
+    entity: rate_plan
+    mode: create
+    success_redirect: list-rate-plans
+    success_toast: Rate plan created
+  update-rate-plan:
+    component: FormView
+    entity: rate_plan
+    mode: edit
+    success_toast: Rate plan updated
+  delete-rate-plan:
+    component: FormView
+    entity: rate_plan
+    mode: action
+    success_toast: Rate plan deleted
+  list-tax-rules:
+    component: DataTable
+    entity: tax_rule
+    searchable: true
+    add_action: add-tax-rule
+  add-tax-rule:
+    component: FormView
+    entity: tax_rule
+    mode: create
+    success_redirect: list-tax-rules
+    success_toast: Tax rule created
+  update-tax-rule:
+    component: FormView
+    entity: tax_rule
+    mode: edit
+    success_toast: Tax rule updated
+  delete-tax-rule:
+    component: FormView
+    entity: tax_rule
+    mode: action
+    success_toast: Tax rule deleted
+  status:
+    component: DashboardView
+    hidden: true

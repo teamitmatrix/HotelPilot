@@ -1,0 +1,2 @@
+# WebClaw API + gateway dependencies (installed via setup_windows.bat).
+-r api/requirements.txt

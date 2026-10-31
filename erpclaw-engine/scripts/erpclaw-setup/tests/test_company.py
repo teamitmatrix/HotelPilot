@@ -1,0 +1,405 @@
+"""Tests for erpclaw-setup company management actions.
+
+Actions tested:
+  - setup-company
+  - update-company
+  - get-company
+  - list-companies
+"""
+import pytest
+import uuid
+from setup_helpers import call_action, ns, seed_company, is_error, is_ok, load_db_query
+
+mod = load_db_query()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# setup-company
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSetupCompany:
+    def test_basic_create(self, conn):
+        """Create a company with just a name — auto-generates abbr, FY, CC, WH."""
+        result = call_action(mod.setup_company, conn, ns(
+            name="Acme Corp",
+            abbr=None,
+            currency=None,
+            country=None,
+            fiscal_year_start_month=None,
+        ))
+        assert result["name"] == "Acme Corp"
+        assert result["abbr"] == "AC"
+        assert "company_id" in result
+        assert "fiscal_year_id" in result
+        assert "cost_center_id" in result
+        assert "warehouse_id" in result
+
+        # Verify in DB
+        row = conn.execute("SELECT * FROM company WHERE id = ?",
+                           (result["company_id"],)).fetchone()
+        assert row is not None
+        assert row["name"] == "Acme Corp"
+        assert row["default_currency"] == "USD"
+        assert row["country"] == "United States"
+
+    def test_custom_abbr_and_currency(self, conn):
+        """Create company with custom abbreviation and currency."""
+        result = call_action(mod.setup_company, conn, ns(
+            name="Euro Trading",
+            abbr="ET",
+            currency="EUR",
+            country="Germany",
+            fiscal_year_start_month=4,
+        ))
+        assert result["abbr"] == "ET"
+        row = conn.execute("SELECT * FROM company WHERE id = ?",
+                           (result["company_id"],)).fetchone()
+        assert row["default_currency"] == "EUR"
+        assert row["country"] == "Germany"
+        assert row["fiscal_year_start_month"] == 4
+        enabled = conn.execute(
+            "SELECT enabled FROM currency WHERE code = 'EUR'"
+        ).fetchone()
+        if enabled is not None:
+            assert enabled["enabled"] == 1
+
+    def test_honors_provided_company_id(self, conn):
+        """setup-company uses --company-id when the caller allocates the tenant UUID."""
+        tenant_id = str(uuid.uuid4())
+        result = call_action(mod.setup_company, conn, ns(
+            name="Harbor Inn",
+            abbr=None,
+            currency="AED",
+            country="United Arab Emirates",
+            fiscal_year_start_month=None,
+            company_id=tenant_id,
+        ))
+        assert result["company_id"] == tenant_id
+        row = conn.execute("SELECT id, name FROM company WHERE id = ?", (tenant_id,)).fetchone()
+        assert row is not None
+        assert row["name"] == "Harbor Inn"
+
+    def test_auto_creates_fiscal_year(self, conn):
+        """setup-company should auto-create a fiscal year."""
+        result = call_action(mod.setup_company, conn, ns(
+            name="FY Test Co",
+            abbr=None, currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        fy = conn.execute("SELECT * FROM fiscal_year WHERE id = ?",
+                          (result["fiscal_year_id"],)).fetchone()
+        assert fy is not None
+        assert fy["company_id"] == result["company_id"]
+        assert fy["is_closed"] == 0
+
+    def test_auto_creates_cost_center(self, conn):
+        """setup-company should auto-create a default cost center."""
+        result = call_action(mod.setup_company, conn, ns(
+            name="CC Test Co",
+            abbr=None, currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        cc = conn.execute("SELECT * FROM cost_center WHERE id = ?",
+                          (result["cost_center_id"],)).fetchone()
+        assert cc is not None
+        assert cc["company_id"] == result["company_id"]
+
+        # Should be set as company default
+        co = conn.execute("SELECT default_cost_center_id FROM company WHERE id = ?",
+                          (result["company_id"],)).fetchone()
+        assert co["default_cost_center_id"] == result["cost_center_id"]
+
+    def test_auto_creates_warehouse(self, conn):
+        """setup-company should auto-create a default warehouse."""
+        result = call_action(mod.setup_company, conn, ns(
+            name="WH Test Co",
+            abbr=None, currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        wh = conn.execute("SELECT * FROM warehouse WHERE id = ?",
+                          (result["warehouse_id"],)).fetchone()
+        assert wh is not None
+        assert wh["company_id"] == result["company_id"]
+
+        # Should be set as company default
+        co = conn.execute("SELECT default_warehouse_id FROM company WHERE id = ?",
+                          (result["company_id"],)).fetchone()
+        assert co["default_warehouse_id"] == result["warehouse_id"]
+
+    def test_audit_log_created(self, conn):
+        """setup-company should write an audit log entry."""
+        result = call_action(mod.setup_company, conn, ns(
+            name="Audit Test Co",
+            abbr=None, currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        log = conn.execute(
+            "SELECT * FROM audit_log WHERE entity_type='company' AND entity_id=?",
+            (result["company_id"],)
+        ).fetchone()
+        assert log is not None
+        assert log["action"] == "create"
+        assert log["skill"] == "erpclaw-setup"
+
+    def test_duplicate_name_auto_disambiguates(self, conn):
+        """Reused brand names get a unique company.name; hotel display name stays."""
+        first = call_action(mod.setup_company, conn, ns(
+            name="Unique Co",
+            abbr="UC", currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        assert first["status"] == "ok"
+        second = call_action(mod.setup_company, conn, ns(
+            name="Unique Co",
+            abbr="UC2", currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        assert second["status"] == "ok"
+        assert second["company_id"] != first["company_id"]
+        assert second["name"] != first["name"]
+        assert second["name"].startswith("Unique Co")
+        assert second.get("display_name") == "Unique Co"
+        # Auto abbr includes a UUID fragment so initials collisions succeed.
+        third = call_action(mod.setup_company, conn, ns(
+            name="Another Brand Hotels",
+            abbr=None, currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        fourth = call_action(mod.setup_company, conn, ns(
+            name="Acme Brand Hotels",
+            abbr=None, currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        assert third["status"] == "ok" and fourth["status"] == "ok"
+        assert third["abbr"] != fourth["abbr"]
+        assert third["abbr"].startswith("ABH")
+        assert fourth["abbr"].startswith("ABH")
+
+    def test_missing_name_fails(self, conn):
+        """setup-company requires --name."""
+        result = call_action(mod.setup_company, conn, ns(
+            name=None,
+            abbr=None, currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        assert is_error(result)
+
+    def test_single_word_name_abbr(self, conn):
+        """Single word name generates first-letter abbreviation plus UUID fragment."""
+        result = call_action(mod.setup_company, conn, ns(
+            name="Tesla",
+            abbr=None, currency=None, country=None,
+            fiscal_year_start_month=None,
+        ))
+        assert result["abbr"].startswith("T")
+        assert len(result["abbr"]) >= 5
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# get-company
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestGetCompany:
+    def test_get_by_id(self, conn):
+        """Retrieve a specific company by ID."""
+        cid = seed_company(conn, name="Get Test", abbr="GT")
+        result = call_action(mod.get_company, conn, ns(company_id=cid))
+        assert result["company"]["id"] == cid
+        assert "Get Test" in result["company"]["name"]
+
+    def test_get_default_company(self, conn):
+        """If no company_id, returns first company."""
+        cid = seed_company(conn)
+        result = call_action(mod.get_company, conn, ns(company_id=None))
+        assert "company" in result
+
+    def test_get_nonexistent_fails(self, conn):
+        """Getting a company with invalid ID returns error."""
+        result = call_action(mod.get_company, conn, ns(
+            company_id="nonexistent-id"
+        ))
+        assert is_error(result)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# list-companies
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestListCompanies:
+    def test_list_empty(self, conn):
+        """List companies when none exist."""
+        result = call_action(mod.list_companies, conn, ns(limit=None, offset=None))
+        assert result["companies"] == []
+        assert result["total_count"] == 0
+
+    def test_list_multiple(self, conn):
+        """List with multiple companies returns all."""
+        seed_company(conn, name="Co A", abbr="CA")
+        seed_company(conn, name="Co B", abbr="CB")
+        seed_company(conn, name="Co C", abbr="CC")
+        result = call_action(mod.list_companies, conn, ns(limit=None, offset=None))
+        assert result["total_count"] == 3
+        assert len(result["companies"]) == 3
+
+    def test_list_pagination(self, conn):
+        """Pagination with limit and offset."""
+        for i in range(5):
+            seed_company(conn, name=f"Page Co {i}", abbr=f"PC{i}")
+        result = call_action(mod.list_companies, conn, ns(limit=2, offset=0))
+        assert len(result["companies"]) == 2
+        assert result["total_count"] == 5
+        assert result["has_more"] is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# update-company
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestUpdateCompany:
+    def test_update_name(self, conn):
+        """Update a company's name."""
+        cid = seed_company(conn, name="Old Name", abbr="ON")
+        result = call_action(mod.update_company, conn, ns(
+            company_id=cid,
+            name="New Name",
+            abbr=None, default_currency=None, country=None,
+            tax_id=None, fiscal_year_start_month=None,
+            default_receivable_account_id=None,
+            default_payable_account_id=None,
+            default_income_account_id=None,
+            default_expense_account_id=None,
+            default_cost_center_id=None,
+            default_warehouse_id=None,
+            default_bank_account_id=None,
+            default_cash_account_id=None,
+            round_off_account_id=None,
+            exchange_gain_loss_account_id=None,
+            perpetual_inventory=None,
+            enable_negative_stock=None,
+            accounts_frozen_till_date=None,
+            role_allowed_for_frozen_entries=None,
+        ))
+        assert "updated_fields" in result
+        assert "name" in result["updated_fields"]
+
+        # Verify in DB
+        row = conn.execute("SELECT name FROM company WHERE id = ?", (cid,)).fetchone()
+        assert row["name"] == "New Name"
+
+    def test_update_no_fields_fails(self, conn):
+        """Update with no fields should error."""
+        cid = seed_company(conn)
+        result = call_action(mod.update_company, conn, ns(
+            company_id=cid,
+            name=None, abbr=None, default_currency=None, country=None,
+            tax_id=None, fiscal_year_start_month=None,
+            default_receivable_account_id=None,
+            default_payable_account_id=None,
+            default_income_account_id=None,
+            default_expense_account_id=None,
+            default_cost_center_id=None,
+            default_warehouse_id=None,
+            default_bank_account_id=None,
+            default_cash_account_id=None,
+            round_off_account_id=None,
+            exchange_gain_loss_account_id=None,
+            perpetual_inventory=None,
+            enable_negative_stock=None,
+            accounts_frozen_till_date=None,
+            role_allowed_for_frozen_entries=None,
+        ))
+        assert is_error(result)
+
+    def test_update_audit_logged(self, conn):
+        """Update should create an audit log entry."""
+        cid = seed_company(conn, name="Audit Update", abbr="AU")
+        call_action(mod.update_company, conn, ns(
+            company_id=cid,
+            name="Audit Updated",
+            abbr=None, default_currency=None, country=None,
+            tax_id=None, fiscal_year_start_month=None,
+            default_receivable_account_id=None,
+            default_payable_account_id=None,
+            default_income_account_id=None,
+            default_expense_account_id=None,
+            default_cost_center_id=None,
+            default_warehouse_id=None,
+            default_bank_account_id=None,
+            default_cash_account_id=None,
+            round_off_account_id=None,
+            exchange_gain_loss_account_id=None,
+            perpetual_inventory=None,
+            enable_negative_stock=None,
+            accounts_frozen_till_date=None,
+            role_allowed_for_frozen_entries=None,
+        ))
+        log = conn.execute(
+            "SELECT * FROM audit_log WHERE entity_type='company' AND action='update'"
+        ).fetchone()
+        assert log is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# onboarding-step subprocess-failure surfacing (A14 follow-up)
+#
+# The wizard's seed steps call subprocess.run() without check=True. Previously a
+# non-zero exit (or a raised exception) was swallowed by `except Exception: pass`
+# AND the return code was never inspected — so a failed step was reported as
+# completed. These tests guard that a failed step now lands in steps_failed and
+# the user-facing prompt says so, instead of silently lying about success.
+# ──────────────────────────────────────────────────────────────────────────────
+
+import json as _json
+import subprocess as _subprocess
+
+
+def _fake_run_factory(fail_steps):
+    """Return a subprocess.run stand-in: setup-company always succeeds (so the
+    wizard reaches the seed steps); each named action in fail_steps exits 1."""
+    def fake_run(cmd, *a, **kw):
+        joined = " ".join(cmd)
+        if "setup-company" in joined:
+            return _subprocess.CompletedProcess(
+                cmd, 0, stdout=_json.dumps({"company_id": "co-test"}), stderr="")
+        for action in ("seed-defaults", "setup-chart-of-accounts", "seed-demo-data"):
+            if action in joined:
+                rc = 1 if action in fail_steps else 0
+                return _subprocess.CompletedProcess(
+                    cmd, rc, stdout="", stderr=(f"{action} boom" if rc else ""))
+        return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    return fake_run
+
+
+def _drive_onboarding_step5(conn, monkeypatch, fail_steps):
+    """Drive onboarding_step from step 4 -> 5 (company create + seed) with a
+    monkeypatched subprocess + state, returning the action result dict."""
+    state = {"step": 4, "completed": False,
+             "data": {"company_name": "TestCo", "currency": "USD", "fiscal_month": 1}}
+    monkeypatch.setattr(mod, "_load_onboarding_state", lambda: state)
+    monkeypatch.setattr(mod, "_save_onboarding_state", lambda s: None)
+    monkeypatch.setattr(mod, "_clear_onboarding_state", lambda: None)
+    monkeypatch.setattr("subprocess.run", _fake_run_factory(fail_steps))
+    return call_action(mod.onboarding_step, conn, ns(reset=False, answer="yes"))
+
+
+class TestOnboardingStepFailureSurfacing:
+    def test_failed_seed_step_is_surfaced_not_swallowed(self, conn, monkeypatch):
+        r = _drive_onboarding_step5(conn, monkeypatch, fail_steps={"seed-defaults"})
+        assert is_ok(r)
+        results = r["results"]
+        # The failed step must NOT be reported as completed...
+        assert "seed-defaults" not in results["steps_completed"]
+        # ...it must be surfaced in steps_failed with the captured detail...
+        failed = {s["step"]: s["error"] for s in results["steps_failed"]}
+        assert "seed-defaults" in failed
+        assert "boom" in failed["seed-defaults"]
+        # ...and the user-facing prompt must say a step did not complete.
+        assert "seed-defaults" in r["prompt"]
+        assert "did not complete" in r["prompt"]
+
+    def test_successful_seed_step_records_completed(self, conn, monkeypatch):
+        r = _drive_onboarding_step5(conn, monkeypatch, fail_steps=set())
+        assert is_ok(r)
+        results = r["results"]
+        assert "seed-defaults" in results["steps_completed"]
+        assert all(s["step"] != "seed-defaults" for s in results["steps_failed"])

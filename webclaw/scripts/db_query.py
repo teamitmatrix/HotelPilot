@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Webclaw management actions — invoked via OpenClaw Telegram interface.
+
+Usage: python3 db_query.py --action <action-name> [--key value ...]
+
+Actions:
+  status           — Show service status, SSL, user count
+  setup-ssl        — Configure HTTPS with Let's Encrypt (--domain required)
+  renew-ssl        — Check and renew SSL certificate
+  list-users       — List web dashboard user accounts
+  create-user      — Create a user (--email, --full-name, --role)
+  reset-password   — Generate new password for a user (--email)
+  disable-user     — Disable a user account (--email)
+  list-sessions    — Show active sessions
+  clear-sessions   — Purge all sessions (force re-login)
+  maintenance      — Cron: clean expired sessions + check cert
+  restart-services — Restart webclaw-api + webclaw-web
+  show-config      — Display current configuration
+"""
+import argparse
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+INSTALL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PMS_ROOT = os.path.dirname(INSTALL_DIR)
+
+
+def _load_api_env():
+    env_path = os.path.join(INSTALL_DIR, "api", ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key and key not in os.environ:
+                value = os.path.expanduser(value)
+                # Relative paths are anchored to the PMS workspace root.
+                if value and not os.path.isabs(value) and (
+                    key.endswith("_PATH") or key.endswith("_HOME") or key.endswith("_DIR")
+                    or key in ("ERPCLAW_HOME", "DATA_DIR", "ERPCLAW_ENGINE_PATH",
+                               "WEBCLAW_DB_PATH", "ERPCLAW_DB_PATH")
+                ):
+                    value = os.path.abspath(os.path.join(PMS_ROOT, value))
+                os.environ[key] = value
+
+
+_load_api_env()
+
+# ── PyPika query builder (from erpclaw shared lib) ──
+_engine = os.environ.get("ERPCLAW_ENGINE_PATH")
+_lib_candidates = []
+if _engine:
+    engine_abs = (
+        _engine if os.path.isabs(os.path.expanduser(_engine))
+        else os.path.abspath(os.path.join(PMS_ROOT, _engine))
+    )
+    _lib_candidates.append(
+        os.path.join(engine_abs, "scripts", "erpclaw-setup", "lib")
+    )
+_lib_candidates.append(
+    os.path.join(PMS_ROOT, "erpclaw-engine", "scripts", "erpclaw-setup", "lib")
+)
+_home = os.environ.get("ERPCLAW_HOME") or os.environ.get("DATA_DIR")
+if _home:
+    home_abs = (
+        os.path.expanduser(_home) if os.path.isabs(os.path.expanduser(_home))
+        else os.path.abspath(os.path.join(PMS_ROOT, _home))
+    )
+    _lib_candidates.append(os.path.join(home_abs, "lib"))
+for _lib in _lib_candidates:
+    if os.path.isdir(os.path.join(_lib, "erpclaw_lib")):
+        sys.path.insert(0, _lib)
+        break
+try:
+    from erpclaw_lib.query import Q, P, Table, Field, fn, CustomFunction, Order
+except ImportError:
+    Q = P = Table = Field = fn = CustomFunction = Order = None
+
+GroupConcat = CustomFunction("GROUP_CONCAT", ["field"]) if CustomFunction else None
+
+
+def _resolve_db_path() -> str:
+    raw = os.environ.get("WEBCLAW_DB_PATH")
+    if raw:
+        expanded = os.path.expanduser(raw)
+        if os.path.isabs(expanded):
+            return os.path.abspath(expanded)
+        return os.path.abspath(os.path.join(PMS_ROOT, expanded))
+    return os.path.join(PMS_ROOT, "data", "webclaw.sqlite")
+
+
+DB_PATH = _resolve_db_path()
+NGINX_CONF = "/etc/nginx/sites-enabled/webclaw"
+_IS_LINUX = sys.platform.startswith("linux")
+
+
+def _get_conn():
+    api_dir = os.path.join(INSTALL_DIR, "api")
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+    import db as webclaw_db
+
+    return webclaw_db.get_connection()
+
+
+def _ok(data):
+    print(json.dumps(data, indent=2, default=str))
+    sys.exit(0)
+
+
+def _fail(msg):
+    print(json.dumps({"status": "error", "message": msg}))
+    sys.exit(1)
+
+
+def _require_linux_ops(feature: str) -> None:
+    """Fail clearly when nginx/systemd/certbot ops are requested off Linux."""
+    if not _IS_LINUX:
+        _fail(
+            f"{feature} requires Linux (systemd/nginx/certbot). "
+            "On Windows, run the API with uvicorn and the web app with npm "
+            "(see scripts/install.ps1)."
+        )
+
+
+def _run(cmd, check=True):
+    """Run a command and return (stdout, returncode). cmd is a list of args."""
+    if isinstance(cmd, str):
+        cmd = cmd.split()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        _fail(f"Command failed: {' '.join(cmd)}\n{result.stderr[:500]}")
+    return result.stdout.strip(), result.returncode
+
+
+def _service_status(name):
+    """Check if a systemd service is active (Linux only)."""
+    if not _IS_LINUX or not shutil.which("systemctl"):
+        return "n/a"
+    _, code = _run(["systemctl", "is-active", name], check=False)
+    return "running" if code == 0 else "stopped"
+
+
+def _hash_password(plain):
+    """PBKDF2-HMAC-SHA256 password hashing (matches api/auth/passwords.py)."""
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", plain.encode(), salt.encode(), 600_000, dklen=32)
+    return f"pbkdf2:600000${salt}${dk.hex()}"
+
+
+# ── Actions ──────────────────────────────────────────────────────────────────
+
+
+def action_status(args):
+    """Show service status, SSL, user count."""
+    api_status = _service_status("webclaw-api")
+    web_status = _service_status("webclaw-web")
+
+    # Check SSL
+    ssl_active = False
+    domain = "_"
+    if os.path.exists(NGINX_CONF):
+        with open(NGINX_CONF) as f:
+            content = f.read()
+        ssl_active = "ssl_certificate" in content
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("server_name") and not line.endswith("_;"):
+                domain = line.split()[-1].rstrip(";")
+                break
+
+    # User count
+    user_count = 0
+    try:
+        conn = _get_conn()
+        wu = Table("webclaw_user")
+        q = Q.from_(wu).select(fn.Count("*"))
+        user_count = conn.execute(q.get_sql()).fetchone()[0]
+    except Exception:
+        pass
+
+    _ok({
+        "status": "ok",
+        "services": {
+            "api": api_status,
+            "web": web_status,
+        },
+        "ssl": ssl_active,
+        "domain": domain,
+        "users": user_count,
+        "db_path": DB_PATH,
+        "install_dir": INSTALL_DIR,
+    })
+
+
+def action_setup_ssl(args):
+    """Configure HTTPS with Let's Encrypt."""
+    _require_linux_ops("setup-ssl")
+    domain = args.domain
+    if not domain:
+        _fail("--domain is required. Example: --domain erp.example.com")
+
+    # Validate domain — strict regex to prevent nginx config injection
+    import re
+    if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$', domain):
+        _fail(f"Invalid domain: {domain}. Must be a valid hostname (e.g., erp.example.com)")
+
+    # Check certbot is available
+    if not shutil.which("certbot"):
+        _fail("certbot not found. Install with: sudo apt install certbot python3-certbot-nginx")
+
+    # Obtain certificate
+    email_addr = args.email or f"admin@{domain}"
+    cmd = ["sudo", "certbot", "certonly", "--nginx", "-d", domain,
+           "--email", email_addr, "--non-interactive", "--agree-tos"]
+    stdout, code = _run(cmd, check=False)
+    if code != 0:
+        _fail(f"certbot failed. Make sure DNS for {domain} points to this server's IP.\n{stdout}")
+
+    # Find certificate paths
+    cert_path = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
+    key_path = f"/etc/letsencrypt/live/{domain}/privkey.pem"
+
+    if not os.path.exists(cert_path):
+        _fail(f"Certificate not found at {cert_path}. certbot may have used a different path.")
+
+    # Generate HTTPS nginx config from template
+    template = os.path.join(INSTALL_DIR, "templates", "nginx-https.conf")
+    if not os.path.exists(template):
+        _fail(f"HTTPS template not found at {template}")
+
+    with open(template) as f:
+        config = f.read()
+
+    config = config.replace("{{DOMAIN}}", domain)
+    config = config.replace("{{SSL_CERT}}", cert_path)
+    config = config.replace("{{SSL_KEY}}", key_path)
+
+    # Write config
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as tmp:
+        tmp.write(config)
+        tmp_path = tmp.name
+
+    _run(["sudo", "cp", tmp_path, NGINX_CONF])
+    os.unlink(tmp_path)
+
+    # Test and reload
+    _, code = _run(["sudo", "nginx", "-t"], check=False)
+    if code != 0:
+        _fail("Nginx config test failed after SSL setup. Reverting...")
+
+    _run(["sudo", "systemctl", "reload", "nginx"])
+
+    _ok({
+        "status": "ok",
+        "message": f"HTTPS enabled for {domain}.\nDashboard: https://{domain}\nHTTP requests redirect to HTTPS automatically.",
+        "domain": domain,
+        "ssl": True,
+        "cert_path": cert_path,
+    })
+
+
+def action_renew_ssl(args):
+    """Check and renew SSL certificate."""
+    _require_linux_ops("renew-ssl")
+    stdout, code = _run(["sudo", "certbot", "renew", "--dry-run"], check=False)
+    if code == 0:
+        _run(["sudo", "certbot", "renew", "--quiet"])
+        _ok({"status": "ok", "message": "SSL certificate renewal check complete."})
+    else:
+        _fail(f"Certificate renewal check failed:\n{stdout[:500]}")
+
+
+def action_list_users(args):
+    """List web dashboard user accounts. Hotel context is limited to that tenant."""
+    conn = _get_conn()
+    tenant_id = os.environ.get("ERPCLAW_TENANT_ID") or getattr(args, "tenant_id", None)
+    u = Table("webclaw_user")
+    ur = Table("webclaw_user_role")
+    r = Table("webclaw_role")
+    q = (
+        Q.from_(u)
+        .left_join(ur).on(ur.user_id == u.id)
+        .left_join(r).on(r.id == ur.role_id)
+        .select(u.id, u.email, u.full_name, u.status, u.last_login,
+                GroupConcat(r.name).as_("roles"))
+    )
+    params = []
+    if tenant_id:
+        q = q.where(u.tenant_id == P())
+        params.append(tenant_id)
+    q = q.groupby(u.id).orderby(u.created_at, order=Order.desc)
+    rows = conn.execute(q.get_sql(), params).fetchall() if params else conn.execute(q.get_sql()).fetchall()
+
+    users = []
+    for r in rows:
+        users.append({
+            "id": r["id"],
+            "email": r["email"],
+            "full_name": r["full_name"],
+            "status": r["status"],
+            "last_login": r["last_login"],
+            "roles": r["roles"].split(",") if r["roles"] else [],
+        })
+
+    _ok({"status": "ok", "users": users, "total": len(users)})
+
+
+def action_create_user(args):
+    """Create a web dashboard user account."""
+    email = args.email
+    if not email:
+        _fail("--email is required")
+
+    full_name = args.full_name or email.split("@")[0]
+    role_name = args.role or "Accounts User"
+
+    # Generate a secure temporary password
+    temp_password = secrets.token_urlsafe(12)
+    pw_hash = _hash_password(temp_password)
+
+    conn = _get_conn()
+
+    # Check if email already exists
+    import uuid
+    wu = Table("webclaw_user")
+    q = Q.from_(wu).select(wu.id).where(wu.email == P())
+    existing = conn.execute(q.get_sql(), (email,)).fetchone()
+    if existing:
+        _fail(f"User with email {email} already exists")
+
+    user_id = str(uuid.uuid4())
+    username = email.split("@")[0]
+
+    try:
+        tenant_id = os.environ.get("ERPCLAW_TENANT_ID") or getattr(args, "tenant_id", None)
+        q = (
+            Q.into(wu)
+            .columns("id", "username", "email", "full_name", "password_hash", "status", "tenant_id")
+            .insert(P(), P(), P(), P(), P(), P(), P())
+        )
+        conn.execute(q.get_sql(), (user_id, username, email, full_name, pw_hash, "active", tenant_id))
+
+        # Find or create role
+        wr = Table("webclaw_role")
+        q = Q.from_(wr).select(wr.id).where(wr.name == P())
+        role = conn.execute(q.get_sql(), (role_name,)).fetchone()
+        if not role:
+            role_id = str(uuid.uuid4())
+            q = (
+                Q.into(wr)
+                .columns("id", "name", "description", "is_system")
+                .insert(P(), P(), P(), P())
+            )
+            conn.execute(q.get_sql(), (role_id, role_name, f"Auto-created role: {role_name}", 0))
+        else:
+            role_id = role["id"]
+
+        wur = Table("webclaw_user_role")
+        q = Q.into(wur).columns("id", "user_id", "role_id").insert(P(), P(), P())
+        conn.execute(q.get_sql(), (str(uuid.uuid4()), user_id, role_id))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        _fail(f"Failed to create user: {e}")
+
+    _ok({
+        "status": "ok",
+        "message": f"User created: {email}\nTemporary password: {temp_password}\nRole: {role_name}\n\nUser must change password on first login.",
+        "user_id": user_id,
+        "email": email,
+        "role": role_name,
+    })
+
+
+def action_reset_password(args):
+    """Reset password for a user. Uses --password if provided, otherwise generates a random one."""
+    email = args.email
+    if not email:
+        _fail("--email is required")
+
+    conn = _get_conn()
+    wu = Table("webclaw_user")
+    q = Q.from_(wu).select(wu.id).where(wu.email == P())
+    user = conn.execute(q.get_sql(), (email,)).fetchone()
+    if not user:
+        _fail(f"User not found: {email}")
+
+    if args.password:
+        chosen_password = args.password
+        pw_hash = _hash_password(chosen_password)
+        msg = f"Password set for {email}\nAll existing sessions have been invalidated."
+    else:
+        chosen_password = secrets.token_urlsafe(12)
+        pw_hash = _hash_password(chosen_password)
+        msg = f"Password reset for {email}\nNew temporary password: {chosen_password}\nAll existing sessions have been invalidated."
+
+    q = Q.update(wu).set(wu.password_hash, P()).where(wu.id == P())
+    conn.execute(q.get_sql(), (pw_hash, user["id"]))
+    # Clear all sessions for this user
+    ws = Table("webclaw_session")
+    q = Q.from_(ws).delete().where(ws.user_id == P())
+    conn.execute(q.get_sql(), (user["id"],))
+    conn.commit()
+
+    _ok({"status": "ok", "message": msg})
+
+
+def action_disable_user(args):
+    """Disable a user account."""
+    email = args.email
+    if not email:
+        _fail("--email is required")
+
+    conn = _get_conn()
+    wu = Table("webclaw_user")
+    q = Q.from_(wu).select(wu.id, wu.status).where(wu.email == P())
+    user = conn.execute(q.get_sql(), (email,)).fetchone()
+    if not user:
+        _fail(f"User not found: {email}")
+
+    q = Q.update(wu).set(wu.status, "disabled").where(wu.id == P())
+    conn.execute(q.get_sql(), (user["id"],))
+    ws = Table("webclaw_session")
+    q = Q.from_(ws).delete().where(ws.user_id == P())
+    conn.execute(q.get_sql(), (user["id"],))
+    conn.commit()
+
+    _ok({"status": "ok", "message": f"User {email} has been disabled and all sessions cleared."})
+
+
+def action_list_sessions(args):
+    """Show active sessions."""
+    conn = _get_conn()
+    s = Table("webclaw_session")
+    u = Table("webclaw_user")
+    q = (
+        Q.from_(s)
+        .join(u).on(u.id == s.user_id)
+        .select(s.id, u.email, s.ip_address, s.user_agent, s.created_at, s.expires_at)
+        .orderby(s.created_at, order=Order.desc)
+        .limit(50)
+    )
+    rows = conn.execute(q.get_sql()).fetchall()
+
+    sessions = []
+    for r in rows:
+        sessions.append({
+            "session_id": r["id"][:8] + "...",
+            "email": r["email"],
+            "ip": r["ip_address"],
+            "user_agent": (r["user_agent"] or "")[:60],
+            "created": r["created_at"],
+            "expires": r["expires_at"],
+        })
+
+    _ok({"status": "ok", "sessions": sessions, "total": len(sessions)})
+
+
+def action_clear_sessions(args):
+    """Purge all sessions (force everyone to re-login)."""
+    conn = _get_conn()
+    ws = Table("webclaw_session")
+    q = Q.from_(ws).select(fn.Count("*"))
+    count = conn.execute(q.get_sql()).fetchone()[0]
+    q = Q.from_(ws).delete()
+    conn.execute(q.get_sql())
+    conn.commit()
+    _ok({"status": "ok", "message": f"Cleared {count} sessions. All users must log in again."})
+
+
+def action_maintenance(args):
+    """Cron target: clean expired sessions + check SSL cert expiry."""
+    conn = _get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Clean expired sessions
+    ws = Table("webclaw_session")
+    q = Q.from_(ws).delete().where(ws.expires_at < P())
+    result = conn.execute(q.get_sql(), (now,))
+    expired = result.rowcount
+    conn.commit()
+
+    # Check SSL cert expiry (Linux/certbot only)
+    ssl_msg = ""
+    if _IS_LINUX and shutil.which("certbot"):
+        stdout, code = _run(["sudo", "certbot", "certificates"], check=False)
+        if code == 0 and "VALID" in stdout:
+            ssl_msg = "SSL certificate is valid."
+        elif code == 0:
+            ssl_msg = "WARNING: SSL certificate may need renewal."
+            _run(["sudo", "certbot", "renew", "--quiet"], check=False)
+    elif not _IS_LINUX:
+        ssl_msg = "SSL/certbot checks skipped on this platform."
+
+    _ok({
+        "status": "ok",
+        "message": f"Maintenance complete. Expired sessions cleaned: {expired}. {ssl_msg}",
+    })
+
+
+def action_restart_services(args):
+    """Restart webclaw-api + webclaw-web systemd services."""
+    _require_linux_ops("restart-services")
+    _run(["sudo", "systemctl", "restart", "webclaw-api", "webclaw-web"])
+    import time
+    time.sleep(2)
+
+    api_status = _service_status("webclaw-api")
+    web_status = _service_status("webclaw-web")
+
+    _ok({
+        "status": "ok",
+        "message": f"Services restarted.\nAPI: {api_status}\nWeb: {web_status}",
+    })
+
+
+def action_show_config(args):
+    """Display current configuration."""
+    # Read nginx config for domain/SSL info
+    domain = "_"
+    ssl = False
+    if os.path.exists(NGINX_CONF):
+        with open(NGINX_CONF) as f:
+            content = f.read()
+        ssl = "ssl_certificate" in content
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("server_name") and not line.endswith("_;"):
+                domain = line.split()[-1].rstrip(";")
+                break
+
+    _ok({
+        "status": "ok",
+        "config": {
+            "install_dir": INSTALL_DIR,
+            "db_path": DB_PATH,
+            "domain": domain,
+            "ssl_enabled": ssl,
+            "api_port": 8001,
+            "web_port": 3000,
+            "nginx_config": NGINX_CONF,
+        },
+    })
+
+
+# ── Action router ───────────────────────────────────────────────────────────
+
+ACTIONS = {
+    "status": action_status,
+    "setup-ssl": action_setup_ssl,
+    "renew-ssl": action_renew_ssl,
+    "list-users": action_list_users,
+    "create-user": action_create_user,
+    "reset-password": action_reset_password,
+    "disable-user": action_disable_user,
+    "list-sessions": action_list_sessions,
+    "clear-sessions": action_clear_sessions,
+    "maintenance": action_maintenance,
+    "restart-services": action_restart_services,
+    "show-config": action_show_config,
+}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Webclaw management actions")
+    parser.add_argument("--action", required=True, choices=list(ACTIONS.keys()))
+    parser.add_argument("--domain", default=None)
+    parser.add_argument("--email", default=None)
+    parser.add_argument("--full-name", default=None)
+    parser.add_argument("--role", default=None)
+    parser.add_argument("--password", default=None)
+
+    args, _unknown = parser.parse_known_args()
+    try:
+        ACTIONS[args.action](args)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _fail(
+            f"{type(e).__name__}: {e}\n\n"
+            "If webclaw is not set up yet, run: "
+            "bash scripts/install.sh (Linux) or powershell -File scripts/install.ps1 (Windows).\n"
+            "Then open https://YOUR_SERVER/setup to create your admin account."
+        )

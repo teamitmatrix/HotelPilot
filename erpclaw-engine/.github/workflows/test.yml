@@ -1,0 +1,53 @@
+name: Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install pytest
+        # cryptography: payroll NACHA encrypts employee bank-account numbers via
+        # erpclaw_lib.crypto → the `cryptography` package (test_nacha_ach.py).
+        run: pip install pytest pypika pyyaml cryptography
+      - name: Setup erpclaw_lib
+        run: |
+          mkdir -p ~/.openclaw/erpclaw/lib
+          cp -r scripts/erpclaw-setup/lib/erpclaw_lib ~/.openclaw/erpclaw/lib/
+      - name: Run unit tests per module
+        run: |
+          failed=0
+          total=0
+          for test_dir in scripts/*/tests; do
+            module=$(basename $(dirname "$test_dir"))
+            # Skip non-test directories and modules needing full monorepo
+            [ "$module" = "erpclaw-setup" ] && test_dir="scripts/erpclaw-setup/tests"
+            [ "$module" = "erpclaw-os" ] && { echo "  $module: skipped (needs monorepo src/)"; continue; }
+            [ ! -d "$test_dir" ] && continue
+
+            echo "=== Testing $module ==="
+            if python -m pytest "$test_dir" -q --tb=short \
+              --rootdir="$(dirname "$test_dir")" \
+              --ignore=scripts/erpclaw-os/tests/test_existing_modules.py \
+              2>&1; then
+              echo "  $module: PASS"
+            else
+              ec=$?
+              if [ $ec -eq 5 ]; then
+                echo "  $module: no tests collected — skipping"
+              else
+                echo "  $module: FAIL (exit $ec)"
+                failed=1
+              fi
+            fi
+            total=$((total + 1))
+          done
+          echo "=== $total modules tested ==="
+          exit $failed

@@ -1,0 +1,75 @@
+# Dependencies and build output
+.venv/
+venv/
+env/
+node_modules/
+.next/
+out/
+dist/
+build/
+coverage/
+.coverage
+htmlcov/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!.env.local.example
+!.env.*.example
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+secrets.json
+credentials.json
+serviceAccount*.json
+*.secret
+
+# Databases, backups, and local operational data
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+*.dump
+*.bak
+data/backups/
+data/sqlite_archive/**/*.sqlite
+data/sqlite_archive/**/*.sqlite3
+
+# Test and browser artifacts
+e2e/.auth/
+test-results/
+playwright-report/
+blob-report/
+
+# Editors and OS
+.vs/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*

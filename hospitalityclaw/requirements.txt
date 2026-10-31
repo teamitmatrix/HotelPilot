@@ -1,0 +1,5 @@
+# HospitalityClaw — runtime uses erpclaw_lib (vendored in erpclaw-engine).
+# These packages are useful for local development and tests on Windows.
+pytest>=7.4
+# PostgreSQL driver used when DB_TYPE=postgres (SQLite stays the default).
+psycopg2-binary==2.9.10
